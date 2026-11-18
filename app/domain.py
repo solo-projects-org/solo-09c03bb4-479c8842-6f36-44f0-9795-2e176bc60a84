@@ -535,6 +535,347 @@ def purge_stale_current(store: Store) -> int:
         return revoked
 
 
+# --------------------------------------------------------------------------- #
+# Reconciliation of a historical publish
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class ReconcileItem:
+    """One classified event as it appeared in a historical publish, followed to
+    wherever that event number currently lives."""
+
+    event_no: str
+    old_revision: int
+    old_unit: str
+    old_day: str
+    old_firmware: str
+    old_fault_code: str
+    old_category: str
+    old_map_revision: int
+
+    current_revision: int | None
+    current_unit: str | None
+    current_day: str | None
+    current_firmware: str | None
+    current_fault_code: str | None
+    current_category: str | None
+    current_map_revision: int | None
+
+    target_publish_id: int | None
+    target_publish_category: str | None
+    # current | unpublished | revoked_pending | missing_mapping |
+    # publish_missing_event | publish_stale_event | publish_stale_category |
+    # no_event
+    target_status: str
+
+    event_changed: bool
+    mapping_changed: bool
+    moved: bool
+    review_reasons: list[str] = field(default_factory=list)
+
+    @property
+    def change_kind(self) -> str:
+        if self.event_changed and self.mapping_changed:
+            return "两者共同变化"
+        if self.event_changed:
+            return "事件更正"
+        if self.mapping_changed:
+            return "映射修订"
+        return "无变化"
+
+    @property
+    def destination(self) -> str:
+        if self.current_unit is None or self.current_day is None:
+            return "（无现行事件）"
+        return f"{self.current_unit} · {self.current_day}"
+
+
+@dataclass
+class ReconcileDestination:
+    unit: str
+    day: str
+    event_nos: list[str]
+    publish_id: int | None
+    missing_mappings: int
+
+
+@dataclass
+class ReconcileReport:
+    publish: sqlite3.Row
+    items: list[ReconcileItem]
+    old_unit: str
+    old_day: str
+    old_day_live_events: list[sqlite3.Row]
+    old_day_publish_id: int | None
+    old_day_all_moved: bool
+    old_day_empty: bool
+    destinations: list[ReconcileDestination]
+    review_reasons: list[str]
+    data_revision: str = ""
+
+    @property
+    def needs_review(self) -> bool:
+        return bool(self.review_reasons)
+
+
+def _latest_event_revision(
+    conn: sqlite3.Connection, event_no: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM events WHERE event_no = ? ORDER BY revision DESC LIMIT 1",
+        (event_no,),
+    ).fetchone()
+
+
+def _current_publish(
+    conn: sqlite3.Connection, unit: str, day: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM publishes WHERE unit = ? AND day = ? AND status = 'CURRENT'",
+        (unit, day),
+    ).fetchone()
+
+
+def data_revision(conn: sqlite3.Connection) -> str:
+    """Fingerprint of the append-only revisions visible in this snapshot.
+
+    Every correction appends a row to one of these tables, so identical tokens
+    mean every query in the reconciliation saw the same set of revisions.
+    """
+    ev = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
+    mp = conn.execute("SELECT COALESCE(MAX(id), 0) FROM mappings").fetchone()[0]
+    pb = conn.execute("SELECT COALESCE(MAX(id), 0) FROM publishes").fetchone()[0]
+    return f"E{ev}/M{mp}/P{pb}"
+
+
+def build_reconcile_report(
+    conn: sqlite3.Connection, publish_id: int
+) -> ReconcileReport:
+    """Follow the events of one historical publish to their current state.
+
+    The caller is responsible for running this on a single snapshot connection
+    (see ``Store.snapshot``) - the whole report must reflect one revision set.
+    """
+    pub = conn.execute("SELECT * FROM publishes WHERE id = ?", (publish_id,)).fetchone()
+    if pub is None:
+        raise LookupError(f"发布号 #{publish_id} 不存在")
+    old_unit, old_day = pub["unit"], pub["day"]
+    old_items = publish_items(conn, publish_id)
+
+    items: list[ReconcileItem] = []
+    reasons: list[str] = []
+
+    def add_reason(text: str) -> None:
+        if text not in reasons:
+            reasons.append(text)
+
+    for oi in old_items:
+        latest = _latest_event_revision(conn, oi["event_no"])
+        media: dict[str, object] = {
+            "event_no": oi["event_no"],
+            "old_revision": oi["revision"],
+            "old_unit": oi["unit"],
+            "old_day": oi["occurred_at"][:10],
+            "old_firmware": oi["firmware_version"],
+            "old_fault_code": oi["fault_code"],
+            "old_category": oi["category"],
+            "old_map_revision": oi["map_revision"],
+        }
+        # A new revision of the event's *old* key tells us whether the mapping
+        # basis of the historical classification itself has moved.
+        old_key_map = effective_mapping(
+            conn, oi["firmware_version"], oi["fault_code"]
+        )
+        mapping_changed = (
+            old_key_map is None
+            or old_key_map["revision"] != oi["map_revision"]
+            or old_key_map["category"] != oi["category"]
+        )
+        item_reasons: list[str] = []
+
+        if latest is None:  # data anomaly: events are append-only
+            item = ReconcileItem(
+                **media,
+                current_revision=None,
+                current_unit=None,
+                current_day=None,
+                current_firmware=None,
+                current_fault_code=None,
+                current_category=None,
+                current_map_revision=None,
+                target_publish_id=None,
+                target_publish_category=None,
+                target_status="no_event",
+                event_changed=True,
+                mapping_changed=mapping_changed,
+                moved=False,
+                review_reasons=item_reasons,
+            )
+            text = f"事件 {oi['event_no']} 在事件表中已不存在，数据异常"
+            item_reasons.append(text)
+            add_reason(text)
+            items.append(item)
+            continue
+
+        current_day = latest["occurred_at"][:10]
+        moved = (latest["unit"], current_day) != (old_unit, old_day)
+        event_changed = latest["revision"] != oi["revision"]
+        mp = effective_mapping(
+            conn, latest["firmware_version"], latest["fault_code"]
+        )
+        current_category = mp["category"] if mp is not None else None
+        target_pub = _current_publish(conn, latest["unit"], current_day)
+        target_category: str | None = None
+        target_status = "unpublished"
+
+        if mp is None:
+            target_status = "missing_mapping"
+            text = (
+                f"事件 {oi['event_no']} 现行修订缺少映射 "
+                f"{latest['firmware_version']}/{latest['fault_code']}"
+            )
+            item_reasons.append(text)
+            add_reason(text)
+        elif target_pub is None:
+            prior = conn.execute(
+                "SELECT 1 FROM publishes WHERE unit = ? AND day = ?"
+                " AND status = 'REVOKED' LIMIT 1",
+                (latest["unit"], current_day),
+            ).fetchone()
+            target_status = "revoked_pending" if prior else "unpublished"
+            text = (
+                f"去向日 {latest['unit']} {current_day} 尚无现行日档"
+                + ("（原日档已撤销，等待重发布）" if prior else "（尚未发布）")
+            )
+            item_reasons.append(text)
+            add_reason(text)
+        else:
+            target_item = conn.execute(
+                "SELECT * FROM publish_items WHERE publish_id = ? AND event_no = ?",
+                (target_pub["id"], oi["event_no"]),
+            ).fetchone()
+            if target_item is None:
+                target_status = "publish_missing_event"
+                text = (
+                    f"去向日 {latest['unit']} {current_day} 的现行日档 "
+                    f"#{target_pub['id']} 未包含事件 {oi['event_no']}，请核对"
+                )
+                item_reasons.append(text)
+                add_reason(text)
+            else:
+                target_category = target_item["category"]
+                if target_item["revision"] != latest["revision"]:
+                    target_status = "publish_stale_event"
+                    text = (
+                        f"去向日 {latest['unit']} {current_day} 的现行日档 "
+                        f"#{target_pub['id']} 采用事件修订 r{target_item['revision']}，"
+                        f"而现行修订为 r{latest['revision']}，请核对"
+                    )
+                    item_reasons.append(text)
+                    add_reason(text)
+                elif (
+                    current_category is not None
+                    and target_category != current_category
+                ):
+                    target_status = "publish_stale_category"
+                    text = (
+                        f"去向日 {latest['unit']} {current_day} 的现行日档 "
+                        f"#{target_pub['id']} 类别 {target_category!r} 与现行映射 "
+                        f"{current_category!r} 不一致，请核对"
+                    )
+                    item_reasons.append(text)
+                    add_reason(text)
+                else:
+                    target_status = "current"
+
+        items.append(
+            ReconcileItem(
+                **media,
+                current_revision=latest["revision"],
+                current_unit=latest["unit"],
+                current_day=current_day,
+                current_firmware=latest["firmware_version"],
+                current_fault_code=latest["fault_code"],
+                current_category=current_category,
+                current_map_revision=mp["revision"] if mp is not None else None,
+                target_publish_id=target_pub["id"] if target_pub else None,
+                target_publish_category=target_category,
+                target_status=target_status,
+                event_changed=event_changed,
+                mapping_changed=mapping_changed,
+                moved=moved,
+                review_reasons=item_reasons,
+            )
+        )
+
+    old_view = day_view(conn, old_unit, old_day)
+    old_day_live = old_view.events
+    old_day_publish_id = old_view.publish["id"] if old_view.publish else None
+    all_moved = bool(items) and all(it.moved for it in items)
+    old_day_empty = all_moved and not old_day_live
+
+    if items and old_day_publish_id is None and old_day_live:
+        add_reason(
+            f"原日 {old_unit} {old_day} 仍有 {len(old_day_live)} 个事件，"
+            "尚未重发布，旧日档不可直接沿用"
+        )
+    if items and not all_moved and old_day_publish_id is None and not old_day_live:
+        add_reason(
+            f"原日 {old_unit} {old_day} 没有现行事件也没有现行日档，"
+            "与事件追踪结果不一致，请核对"
+        )
+    if items and old_day_publish_id is not None and not old_day_live:
+        add_reason(
+            f"原日 {old_unit} {old_day} 存在现行日档但当前没有任何事件，"
+            "数据不一致，请核对"
+        )
+
+    destinations: dict[tuple[str, str], list[ReconcileItem]] = {}
+    for it in items:
+        if it.current_unit is not None and it.current_day is not None:
+            destinations.setdefault((it.current_unit, it.current_day), []).append(it)
+    destination_rows = []
+    for (unit, day), group in sorted(destinations.items()):
+        dest_pub = _current_publish(conn, unit, day)
+        destination_rows.append(
+            ReconcileDestination(
+                unit=unit,
+                day=day,
+                event_nos=[it.event_no for it in group],
+                publish_id=dest_pub["id"] if dest_pub is not None else None,
+                missing_mappings=sum(
+                    1 for it in group if it.current_category is None
+                ),
+            )
+        )
+
+    return ReconcileReport(
+        publish=pub,
+        items=items,
+        old_unit=old_unit,
+        old_day=old_day,
+        old_day_live_events=old_day_live,
+        old_day_publish_id=old_day_publish_id,
+        old_day_all_moved=all_moved,
+        old_day_empty=old_day_empty,
+        destinations=destination_rows,
+        review_reasons=reasons,
+        data_revision=data_revision(conn),
+    )
+
+
+def reconcile_publish(store: Store, publish_id: int) -> ReconcileReport:
+    """Reconcile on one read snapshot so interleaved corrections cannot produce
+    a report that mixes revisions (events from before, mappings from after)."""
+    with store.snapshot() as conn:
+        before = data_revision(conn)
+        report = build_reconcile_report(conn, publish_id)
+        after = data_revision(conn)
+        if before != after:  # pragma: no cover - defensive, snapshot prevents it
+            raise Conflict("对账期间数据修订发生变化，请重试")
+        return report
+
+
 def available_days(conn: sqlite3.Connection) -> list[dict]:
     """Daily files that are currently available for downstream consumption."""
     rows = conn.execute(

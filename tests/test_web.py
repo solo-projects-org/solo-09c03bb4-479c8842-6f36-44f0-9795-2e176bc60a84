@@ -157,3 +157,90 @@ def test_api_unavailable_reasons(client):
     assert body["available"] is False
     assert "缺少类别映射" in body["reasons"]
     assert body["missing_mappings"][0]["fault_code"] == "E-1042"
+
+
+def _map(client, fw="FW-1.4", code="E-1042", revision=1, category="变桨系统"):
+    return client.post(
+        "/mappings",
+        data={
+            "firmware_version": fw,
+            "fault_code": code,
+            "revision": revision,
+            "category": category,
+        },
+        follow_redirects=False,
+    )
+
+
+def _publish(client, unit, day):
+    form = revision_form(client, unit, day)
+    r = client.post(f"/days/{unit}/{day}/publish", data=form, follow_redirects=False)
+    assert "ok=1" in r.headers["location"], r.headers["location"]
+    with main.store.read() as conn:
+        return conn.execute(
+            "SELECT id FROM publishes WHERE unit=? AND day=? AND status='CURRENT'",
+            (unit, day),
+        ).fetchone()["id"]
+
+
+def test_reconcile_page_empty_state_lists_recent_publishes(client):
+    page = client.get("/reconcile").text
+    assert "历史日档对账" in page
+    assert "还没有任何日档发布记录" in page
+
+
+def test_reconcile_page_invalid_and_unknown_publish_id(client):
+    page = client.get("/reconcile?publish_id=abc").text
+    assert "发布号必须是整数" in page
+
+    page = client.get("/reconcile?publish_id=999").text
+    assert "不存在" in page
+
+
+def test_reconcile_page_shows_old_and_new_classification(client):
+    post_event(client)
+    _map(client, category="旧类")
+    pid = _publish(client, "WTG-01", "2026-03-01")
+
+    # Mapping revision -> new category, republish.
+    _map(client, revision=2, category="新类")
+    _publish(client, "WTG-01", "2026-03-01")
+
+    page = client.get(f"/reconcile?publish_id={pid}").text
+    assert "旧类" in page and "新类" in page
+    assert "映射修订" in page
+    assert "数据修订" in page
+
+
+def test_reconcile_page_flags_all_moved_empty_day(client):
+    post_event(client, event_no="EVT-1", occurred_at="2026-03-01T01:00:00Z")
+    post_event(client, event_no="EVT-2", occurred_at="2026-03-01T02:00:00Z")
+    _map(client)
+    pid = _publish(client, "WTG-01", "2026-03-01")
+
+    for no in ("EVT-1", "EVT-2"):
+        post_event(
+            client, event_no=no, revision=2,
+            unit="WTG-02", occurred_at="2026-03-05T01:00:00Z",
+        )
+
+    page = client.get(f"/reconcile?publish_id={pid}").text
+    assert "原日已清空" in page
+    assert "不应发布空日档" in page
+    assert "当作 0" in page
+    assert "待核对" in page
+
+
+def test_reconcile_page_flags_missing_mapping(client):
+    post_event(client)
+    _map(client)
+    pid = _publish(client, "WTG-01", "2026-03-01")
+
+    post_event(
+        client, revision=2, firmware_version="FW-NO", fault_code="Z-9",
+        occurred_at="2026-03-01T03:00:00Z",
+    )
+
+    page = client.get(f"/reconcile?publish_id={pid}").text
+    assert "映射缺失" in page or "缺少映射" in page
+    assert "待核对及原因" in page

@@ -59,4 +59,6 @@ form.inline { margin-top: 10px; }
 .pill.bad { background: var(--bad-bg); color: var(--bad); }
 .pill.warn { background: var(--warn-bg); color: var(--warn); }
 ul.missing li { color: var(--bad); }
+ul.reasons { margin: 4px 0 0; padding-left: 18px; font-size: 13px; color: var(--bad); }
+ul.reasons li { margin: 2px 0; }
 footer { text-align: center; color: var(--muted); font-size: 12px; padding: 20px; }

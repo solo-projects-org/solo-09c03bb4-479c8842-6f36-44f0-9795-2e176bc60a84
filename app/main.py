@@ -217,6 +217,36 @@ def day_revoke(request: Request, unit: str, day: str):
 
 
 # --------------------------------------------------------------------------- #
+# Historical reconciliation
+# --------------------------------------------------------------------------- #
+
+@app.get("/reconcile")
+def reconcile_page(request: Request, publish_id: str | None = None):
+    with store.read() as conn:
+        recent = domain.all_publishes(conn)[:20]
+    report = None
+    error = None
+    if publish_id is not None and publish_id.strip():
+        try:
+            pid = int(publish_id)
+        except ValueError:
+            error = f"发布号必须是整数：{publish_id!r}"
+        else:
+            try:
+                report = domain.reconcile_publish(store, pid)
+            except LookupError as exc:
+                error = str(exc)
+    return render(
+        request,
+        "reconcile.html",
+        report=report,
+        error=error,
+        publish_id=publish_id or "",
+        recent=recent,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Read API for the analysis group
 # --------------------------------------------------------------------------- #
 

@@ -149,6 +149,30 @@ class Store:
         finally:
             conn.close()
 
+    @contextmanager
+    def snapshot(self) -> Iterator[sqlite3.Connection]:
+        """Consistent read-only view for a multi-query report.
+
+        In WAL mode a deferred ``BEGIN`` pins the snapshot at the first read, so
+        every SELECT in this block sees the same committed revision of the
+        database even if corrections commit meanwhile.  Comparing an old publish
+        with current events and mappings is only meaningful if all three come
+        from one such snapshot.
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN")
+            yield conn
+            conn.execute("ROLLBACK")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
 
 def log(conn: sqlite3.Connection, action: str, detail: str) -> None:
     conn.execute(
